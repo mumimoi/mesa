@@ -1,0 +1,126 @@
+name: Build Mesa 24.3.0 + droidvm KGSL patches (Debian trixie arm64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_version:
+        description: "Mesa version (fixed to 24.3.0 for this workflow)"
+        required: true
+        default: "24.3.0"
+
+permissions:
+  contents: read
+
+jobs:
+  debian-trixie:
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: debian:trixie-slim
+      options: --privileged --user root
+
+    steps:
+      - name: Install dependencies
+        run: |
+          set -eux
+          sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources
+          apt update
+          apt build-dep -y mesa
+          apt install -y \
+            git wget ca-certificates xz-utils patch \
+            ccache meson ninja-build pkg-config \
+            python3-mako python3-packaging \
+            libarchive-dev libxfixes-dev
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: /root/.ccache
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Configure ccache
+        run: |
+          set -eux
+          export CCACHE_DIR=/root/.ccache
+          ccache --max-size=2G
+          ccache --show-config
+          ccache --zero-stats
+          ccache --show-stats
+
+      - name: Download Mesa source (24.3.0) + verify sha256
+        run: |
+          set -eux
+          MESA_VERSION="${{ github.event.inputs.mesa_version }}"
+          test "$MESA_VERSION" = "24.3.0"
+          wget -q "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz"
+          echo "97813fe65028ef21b4d4e54164563059e8408d8fee3489a2323468d198bf2efc  mesa-${MESA_VERSION}.tar.xz" | sha256sum -c -
+          tar -xf "mesa-${MESA_VERSION}.tar.xz"
+          echo "MESA_SRC_DIR=mesa-${MESA_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Fetch droidvm patchset + apply patches
+        run: |
+          set -eux
+          git clone --depth 1 https://github.com/droidvm/mesa-freedreno-patchs.git /tmp/droidvm-patches
+          PATCH_DIR="/tmp/droidvm-patches/freedreno-kgsl-patchs-for-24.3.0"
+          test -d "$PATCH_DIR"
+
+          cd "${{ env.MESA_SRC_DIR }}"
+          # apply in numeric order (0002, 0003, 0007, 0010..0015, dst)
+          ls -1 "$PATCH_DIR"/*.patch | sort -V | while read -r p; do
+            echo "==> applying: $p"
+            patch -p1 < "$p"
+          done
+
+      - name: Meson configure (freedreno + turnip, KGSL; NO zink)
+        shell: bash
+        run: |
+          set -eux
+          export CCACHE_DIR=/root/.ccache
+          cd "${{ env.MESA_SRC_DIR }}"
+
+          meson setup build/ \
+            --prefix=/usr \
+            -Dbuildtype=release \
+            -Dplatforms=x11 \
+            -Dgallium-drivers=freedreno \
+            -Dvulkan-drivers=freedreno \
+            -Dfreedreno-kmds=kgsl \
+            -Dgbm=enabled \
+            -Degl=enabled \
+            -Dgles2=enabled \
+            -Dglvnd=enabled \
+            -Dshared-glapi=enabled \
+            -Dglx=dri \
+            -Dgallium-va=disabled \
+            -Dgallium-xa=disabled \
+            -Dgallium-nine=false \
+            -Dgallium-opencl=disabled \
+            -Dvalgrind=disabled \
+            -Dlibunwind=disabled
+
+          ninja -C build/
+          ccache --show-stats || true
+
+      - name: Package install tree
+        shell: bash
+        run: |
+          set -eux
+          cd "${{ env.MESA_SRC_DIR }}"
+          rm -rf /tmp/mesa-install-tmp
+          mkdir -p /tmp/mesa-install-tmp
+          DESTDIR=/tmp/mesa-install-tmp meson install -C build/
+
+          MESA_VERSION="${{ github.event.inputs.mesa_version }}"
+          OUT="mesa-${MESA_VERSION}-kgsl_debian_trixie_arm64.tar.xz"
+          tar -cJf "$OUT" -C /tmp/mesa-install-tmp .
+          sha256sum "$OUT" | tee sha256sums.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa-${{ github.event.inputs.mesa_version }}-kgsl_debian_trixie_arm64
+          path: |
+            ${{ env.MESA_SRC_DIR }}/mesa-*.tar.xz
+            ${{ env.MESA_SRC_DIR }}/sha256sums.txt
+          retention-days: 90
