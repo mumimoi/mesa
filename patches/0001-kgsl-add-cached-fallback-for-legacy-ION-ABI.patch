@@ -1,0 +1,145 @@
+From 7afd4845101e73f22689450055d093ca358f6245 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 21 Feb 2026 00:08:19 +0800
+Subject: [PATCH] kgsl: add cached fallback for legacy ION ABI
+
+---
+ src/freedreno/drm/kgsl/kgsl_bo.c | 99 ++++++++++++++++++++++++++++----
+ 1 file changed, 88 insertions(+), 11 deletions(-)
+
+diff --git a/src/freedreno/drm/kgsl/kgsl_bo.c b/src/freedreno/drm/kgsl/kgsl_bo.c
+index d424002..fdb9bef 100644
+--- a/src/freedreno/drm/kgsl/kgsl_bo.c
++++ b/src/freedreno/drm/kgsl/kgsl_bo.c
+@@ -3,6 +3,9 @@
+ #include "util/os_mman.h"
+ 
+ #include <linux/dma-heap.h>
++#include <errno.h>
++#include <fcntl.h>
++
+ 
+ static uint64_t
+ kgsl_bo_iova(struct fd_bo *bo)
+@@ -196,33 +199,107 @@ dma_heap_alloc(uint64_t size)
+    int dma_heap = open("/dev/dma_heap/system", O_RDONLY);
+ 
+    if (dma_heap < 0) {
+-      int ion_heap = open("/dev/ion", O_RDONLY);
++      /* Cache ION ABI detection:
++       *  -1 = unknown, 0 = legacy (handle->share fd), 1 = new (fd returned directly)
++       */
++      static int ion_abi = -1;
++      const __u32 heap_mask = (1U << 0) | (1U << 25);
++
++      int ion_heap = open("/dev/ion", O_RDWR | O_CLOEXEC);
+ 
+       if (ion_heap < 0)
+          return -1;
+ 
+-      struct ion_allocation_data {
++      /* Try "new" ABI first (what droidvm patch expects). If ioctl isn't supported
++       * on this kernel (ENOTTY), permanently fall back to legacy ABI.
++       */
++      if (ion_abi != 0) {
++         struct ion_allocation_data {
++            __u64 len;
++            __u32 heap_id_mask;
++            __u32 flags;
++            __u32 fd;
++            __u32 unused;
++         } alloc_data = {
++            .len = size,
++            /* ION_HEAP_SYSTEM | ION_SYSTEM_HEAP_ID */
++            .heap_id_mask = heap_mask,
++            .flags = 0, /* uncached */
++            .fd = 0,
++            .unused = 0,
++         };
++
++         ret = kgsl_pipe_safe_ioctl(ion_heap, _IOWR('I', 0, struct ion_allocation_data),
++                         &alloc_data);
++
++         if (!ret && (int)alloc_data.fd >= 0) {
++            ion_abi = 1;
++            close(ion_heap);
++            return (int)alloc_data.fd;
++         }
++
++         if (ret && errno == ENOTTY) {
++            ion_abi = 0;
++         } else {
++            int e = errno;
++            close(ion_heap);
++            errno = e;
++            return -1;
++         }
++      }
++
++      /* Legacy ION ABI:
++       *  ION_IOC_ALLOC (nr 0) returns a handle, then ION_IOC_SHARE (nr 4) returns a dmabuf fd,
++       *  finally ION_IOC_FREE (nr 1) releases the handle (best-effort).
++       */
++      struct ion_allocation_data_legacy {
+          __u64 len;
++         __u64 align;
+          __u32 heap_id_mask;
+          __u32 flags;
+-         __u32 fd;
+-         __u32 unused;
+-      } alloc_data = {
++         int handle;
++      } alloc_legacy = {
+          .len = size,
+-         /* ION_HEAP_SYSTEM | ION_SYSTEM_HEAP_ID */
+-         .heap_id_mask = (1U << 0) | (1U << 25),
++         .align = 0,
++         .heap_id_mask = heap_mask,
+          .flags = 0, /* uncached */
++         .handle = 0,
+       };
+ 
+-      ret = kgsl_pipe_safe_ioctl(ion_heap, _IOWR('I', 0, struct ion_allocation_data),
+-                      &alloc_data);
++      ret = kgsl_pipe_safe_ioctl(ion_heap, _IOWR('I', 0, struct ion_allocation_data_legacy),
++                         &alloc_legacy);
++
++      if (ret) {
++         int e = errno;
++         close(ion_heap);
++         errno = e;
++         return -1;
++      }
++
++      struct ion_fd_data_legacy {
++         int handle;
++         int fd;
++      } share = {
++         .handle = alloc_legacy.handle,
++         .fd = 0,
++      };
++
++      ret = kgsl_pipe_safe_ioctl(ion_heap, _IOWR('I', 4, struct ion_fd_data_legacy), &share);
++      int share_errno = errno;
++
++      struct ion_handle_data_legacy {
++         int handle;
++      } free_h = { .handle = alloc_legacy.handle };
++      kgsl_pipe_safe_ioctl(ion_heap, _IOWR('I', 1, struct ion_handle_data_legacy), &free_h);
+ 
+       close(ion_heap);
+ 
+-      if (ret)
++      if (ret) {
++         errno = share_errno;
+          return -1;
++      }
+ 
+-      return alloc_data.fd;
++      return (int)share.fd;
+    } else {
+       struct dma_heap_allocation_data alloc_data = {
+          .len = size,
+-- 
+2.53.0
+

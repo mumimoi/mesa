@@ -78,7 +78,7 @@ jobs:
         run: |
           set -eux
           cd "${{ env.MESA_SRC_DIR }}"
-          patch -p1 < "${GITHUB_WORKSPACE}/patches/0016-kgsl-ion-legacy-fallback.patch"
+          patch -p1 < "${GITHUB_WORKSPACE}/patches/0001-kgsl-add-cached-fallback-for-legacy-ION-ABI.patch"
 
       - name: Meson configure (freedreno + turnip, KGSL; NO zink)
         shell: bash
