@@ -1,14 +1,22 @@
 diff --git a/src/freedreno/drm/kgsl/kgsl_bo.c b/src/freedreno/drm/kgsl/kgsl_bo.c
 --- a/src/freedreno/drm/kgsl/kgsl_bo.c
 +++ b/src/freedreno/drm/kgsl/kgsl_bo.c
-@@ -1,60 +1,156 @@
+@@ -1,10 +1,11 @@
+ #include "util/os_mman.h"
+ 
+ #include <linux/dma-heap.h>
++#include <errno.h>
+ 
+ static uint64_t
+ kgsl_bo_iova(struct fd_bo *bo)
+@@ -233,49 +234,136 @@
  static int
  dma_heap_alloc(uint64_t size)
  {
-    int ret;
-    int dma_heap = open("/dev/dma_heap/system", O_RDONLY);
-
-    if (dma_heap < 0) {
+-   int ret;
+-   int dma_heap = open("/dev/dma_heap/system", O_RDONLY);
+-
+-   if (dma_heap < 0) {
 -      int ion_heap = open("/dev/ion", O_RDONLY);
 -
 -      if (ion_heap < 0)
@@ -36,20 +44,36 @@ diff --git a/src/freedreno/drm/kgsl/kgsl_bo.c b/src/freedreno/drm/kgsl/kgsl_bo.c
 -         return -1;
 -
 -      return alloc_data.fd;
-+      /* Ensure errno/ENOTTY are available even if the file didn't include errno.h */
-+      #include <errno.h>
+-   } else {
+-      struct dma_heap_allocation_data alloc_data = {
+-         .len = size,
+-         .fd_flags = O_RDWR | O_CLOEXEC,
+-      };
+-
+-      ret = kgsl_pipe_safe_ioctl(dma_heap, DMA_HEAP_IOCTL_ALLOC, &alloc_data);
+-
+-      close(dma_heap);
+-
+-      if (ret)
+-         return -1;
+-
+-      return alloc_data.fd;
+-   }
++   int ret;
++   int dma_heap = open("/dev/dma_heap/system", O_RDONLY);
 +
++   if (dma_heap < 0) {
 +      /* Cache detected ION ABI:
 +       *   -1 = unknown, 0 = legacy(handle->share fd), 1 = new(fd returned directly)
 +       */
 +      static int ion_abi = -1;
-+      const __u32 heap_mask = (1U << 0) | (1U << 25); /* same mask as droidvm patch */
++      const __u32 heap_mask = (1U << 0) | (1U << 25);
 +
 +      int ion_heap = open("/dev/ion", O_RDWR | O_CLOEXEC);
 +      if (ion_heap < 0)
 +         return -1;
 +
-+      /* --- Try "new" ION ABI first (fd returned directly) --- */
++      /* Try "new" ION ABI first (fd returned directly) */
 +      if (ion_abi != 0) {
 +         struct ion_allocation_data_new_uapi {
 +            __u64 len;
@@ -57,28 +81,27 @@ diff --git a/src/freedreno/drm/kgsl/kgsl_bo.c b/src/freedreno/drm/kgsl/kgsl_bo.c
 +            __u32 flags;
 +            __u32 fd;
 +            __u32 unused;
-+         } alloc_new = {
++         } alloc_data = {
 +            .len = size,
 +            .heap_id_mask = heap_mask,
-+            .flags = 0, /* uncached */
++            .flags = 0,
 +            .fd = 0,
 +            .unused = 0,
 +         };
 +
 +         ret = kgsl_pipe_safe_ioctl(ion_heap,
 +                                    _IOWR('I', 0, struct ion_allocation_data_new_uapi),
-+                                    &alloc_new);
++                                    &alloc_data);
 +
-+         if (!ret && (int)alloc_new.fd >= 0) {
++         if (!ret && (int)alloc_data.fd >= 0) {
 +            ion_abi = 1;
 +            close(ion_heap);
-+            return (int)alloc_new.fd;
++            return (int)alloc_data.fd;
 +         }
 +
-+         /* ABI mismatch: legacy kernels typically return ENOTTY (sometimes EINVAL) */
 +         if (ret && (errno == ENOTTY || errno == EINVAL)) {
-+            ion_abi = 0;
-+         } else if (ret) {
++            ion_abi = 0; /* switch permanently to legacy */
++         } else {
 +            int e = errno;
 +            close(ion_heap);
 +            errno = e;
@@ -86,7 +109,7 @@ diff --git a/src/freedreno/drm/kgsl/kgsl_bo.c b/src/freedreno/drm/kgsl/kgsl_bo.c
 +         }
 +      }
 +
-+      /* --- Legacy ION ABI fallback (handle -> share fd -> free handle) --- */
++      /* Legacy ION ABI: alloc handle -> share fd -> free handle */
 +      struct ion_allocation_data_legacy_uapi {
 +         __u64 len;
 +         __u64 align;
@@ -97,7 +120,7 @@ diff --git a/src/freedreno/drm/kgsl/kgsl_bo.c b/src/freedreno/drm/kgsl/kgsl_bo.c
 +         .len = size,
 +         .align = 0,
 +         .heap_id_mask = heap_mask,
-+         .flags = 0, /* uncached */
++         .flags = 0,
 +         .handle = 0,
 +      };
 +
@@ -124,12 +147,10 @@ diff --git a/src/freedreno/drm/kgsl/kgsl_bo.c b/src/freedreno/drm/kgsl/kgsl_bo.c
 +                                 &share);
 +      int share_errno = errno;
 +
-+      /* Best-effort free the handle (avoid leaking handle refs) */
++      /* Best-effort free handle */
 +      struct ion_handle_data_legacy_uapi {
 +         __u32 handle;
-+      } free_h = {
-+         .handle = alloc_legacy.handle,
-+      };
++      } free_h = { .handle = alloc_legacy.handle };
 +      kgsl_pipe_safe_ioctl(ion_heap,
 +                           _IOWR('I', 1, struct ion_handle_data_legacy_uapi),
 +                           &free_h);
@@ -142,19 +163,18 @@ diff --git a/src/freedreno/drm/kgsl/kgsl_bo.c b/src/freedreno/drm/kgsl/kgsl_bo.c
 +      }
 +
 +      return (int)share.fd;
-    } else {
-       struct dma_heap_allocation_data alloc_data = {
-          .len = size,
-          .fd_flags = O_RDWR | O_CLOEXEC,
-       };
-
-       ret = kgsl_pipe_safe_ioctl(dma_heap, DMA_HEAP_IOCTL_ALLOC, &alloc_data);
-
-       close(dma_heap);
-
-       if (ret)
-          return -1;
-
-       return alloc_data.fd;
-    }
++   } else {
++      struct dma_heap_allocation_data alloc_data = {
++         .len = size,
++         .fd_flags = O_RDWR | O_CLOEXEC,
++      };
++
++      ret = kgsl_pipe_safe_ioctl(dma_heap, DMA_HEAP_IOCTL_ALLOC, &alloc_data);
++      close(dma_heap);
++
++      if (ret)
++         return -1;
++
++      return alloc_data.fd;
++   }
  }
