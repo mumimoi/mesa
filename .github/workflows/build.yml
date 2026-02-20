@@ -19,6 +19,8 @@ jobs:
       options: --privileged --user root
 
     steps:
+      - uses: actions/checkout@v4
+
       - name: Install dependencies
         run: |
           set -eux
@@ -71,6 +73,12 @@ jobs:
             echo "==> applying: $p"
             patch -p1 < "$p"
           done
+
+      - name: Apply local extra patches
+        run: |
+          set -eux
+          cd "${{ env.MESA_SRC_DIR }}"
+          patch -p1 < "${GITHUB_WORKSPACE}/patches/0016-kgsl-ion-legacy-fallback.patch"
 
       - name: Meson configure (freedreno + turnip, KGSL; NO zink)
         shell: bash
